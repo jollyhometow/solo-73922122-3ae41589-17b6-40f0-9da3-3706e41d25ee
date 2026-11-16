@@ -14,7 +14,6 @@ import asyncio
 import os
 import shutil
 import signal
-import sys
 from pathlib import Path
 
 from . import config
@@ -106,14 +105,21 @@ async def run_recalc(
         str(input_path.resolve()),
     ]
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=str(task_dir),
-        env=_build_env(),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,  # 独立进程组，便于整组 kill
-    )
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(task_dir),
+            env=_build_env(),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,  # 独立进程组，便于整组 kill
+        )
+    except asyncio.CancelledError:
+        # 子进程尚未创建就被取消（如排队任务恰好在此时被取消）
+        raise RecalcCancelled("任务已取消") from None
+    except OSError as exc:
+        raise RecalcFailed(f"无法启动 LibreOffice：{exc}") from exc
 
     deadline = asyncio.get_running_loop().time() + config.RECALC_TIMEOUT_SECONDS
 
@@ -249,34 +255,21 @@ async def _drain_stream(stream) -> str:
         return ""
 
 
-def _on_rm_error(func, path, exc_info):
-    """shutil.rmtree 的 onerror（Python ≤3.11）：只读文件改权限后重试。"""
-    try:
-        os.chmod(path, 0o700)
-        func(path)
-    except (PermissionError, FileNotFoundError, OSError):
-        # 最后兜底：环境不允许删除时不阻断终态流转
-        pass
+def cleanup_task_dir(task_dir: Path) -> bool:
+    """删除任务暂存目录（原件、profile、输出全部清除）。
 
+    已完全清除返回 True；删除失败（如父目录写权限被管理员收回）抛出
+    OSError，由调用方把任务转入待清理状态并稍后重试。
 
-def _on_rm_error_312(func, path, exc):
-    """shutil.rmtree 的 onexc（Python ≥3.12）。"""
-    _on_rm_error(func, path, None)
-
-
-def cleanup_task_dir(task_dir: Path) -> None:
-    """任务终态后清理暂存（原件、profile、输出全部删除）。"""
+    本函数绝不 chmod 任何目录/文件：暂存父目录的权限由管理员掌控，
+    服务不得擅自修改；权限不足时应当等待恢复，而不是强行改权限。
+    （Linux 下删除文件只需父目录可写，子进程留下的只读文件不影响删除。）
+    """
     if not task_dir.exists():
-        return
-    # 子进程可能留下只读文件，先恢复写权限再删除
-    for root, dirs, files in os.walk(task_dir):
-        for name in dirs + files:
-            try:
-                os.chmod(os.path.join(root, name), 0o700)
-            except (PermissionError, FileNotFoundError):
-                pass
-    # Python 3.12 起 onerror 改名为 onexc
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(task_dir, onexc=_on_rm_error_312)
-    else:
-        shutil.rmtree(task_dir, onerror=_on_rm_error)
+        return True
+    try:
+        shutil.rmtree(task_dir)
+    except FileNotFoundError:
+        # 并发清理：另一协程已删除，视为成功
+        pass
+    return not task_dir.exists()

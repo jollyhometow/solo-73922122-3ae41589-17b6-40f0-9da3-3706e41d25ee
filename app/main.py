@@ -25,9 +25,13 @@ async def lifespan(app: FastAPI):
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     config.STAGING_DIR.mkdir(parents=True, exist_ok=True)
     config.TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    # 重启恢复：未走完终态的批次标记为中断
+    # 重启恢复：未走完终态的批次标记为中断；
+    # 待清理批次保持原收尾原因并接续清理
     manager.recover_on_startup()
+    # 启动全部待清理重试协程（存储恢复后自动续清）
+    await manager.resume_cleanup_retries()
     yield
+    await manager.shutdown()
 
 
 app = FastAPI(
@@ -53,7 +57,8 @@ async def rejected_handler(_request, exc: WorkbookRejected):
 @app.get("/health", tags=["运维"])
 async def health():
     return {"status": "ok", "slots_in_use": manager.slots.in_use,
-            "slots_capacity": config.MAX_CONCURRENT_BATCHES}
+            "slots_capacity": config.MAX_CONCURRENT_BATCHES,
+            "cleanup_pending": await manager.cleanup_pending_count()}
 
 
 @app.post(
@@ -142,21 +147,28 @@ async def cancel_task(task_id: str):
                     "message": f"任务不存在：{task_id}"},
         )
     if not accepted:
+        if record["status"] == TaskStatus.CLEANUP_PENDING.value:
+            message = "任务正在清退暂存（待清理），不可取消"
+        else:
+            message = f"任务已处于终态 {record['status']}，不可取消"
         return CancelResponse(
             task_id=task_id,
             status=TaskStatus(record["status"]),
             cancel_requested=True,
-            message=f"任务已处于终态 {record['status']}，不可取消",
+            message=message,
         )
+    status = record["status"]
+    if status == TaskStatus.RUNNING.value:
+        message = "取消已立即受理，进程退出且暂存清理后释放名额"
+    elif status == TaskStatus.CLEANUP_PENDING.value:
+        message = "取消已受理；暂存删除失败，转入待清理，存储恢复后自动续清"
+    else:
+        message = "排队任务已取消，结果不发布"
     return CancelResponse(
         task_id=task_id,
-        status=TaskStatus(record["status"]),
+        status=TaskStatus(status),
         cancel_requested=True,
-        message=(
-            "取消已立即受理，进程退出且暂存清理后释放名额"
-            if record["status"] == TaskStatus.RUNNING.value
-            else "排队任务已取消，结果不发布"
-        ),
+        message=message,
     )
 
 

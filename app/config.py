@@ -26,6 +26,10 @@ MAX_CONCURRENT_BATCHES = _env_int("MAX_CONCURRENT_BATCHES", 2)
 RECALC_TIMEOUT_SECONDS = _env_int("RECALC_TIMEOUT_SECONDS", 10)
 # 轮询子进程的间隔
 POLL_INTERVAL_SECONDS = float(os.environ.get("POLL_INTERVAL_SECONDS", "0.2"))
+# 暂存删除失败后的自动续清重试间隔（秒）
+CLEANUP_RETRY_INTERVAL_SECONDS = float(
+    os.environ.get("CLEANUP_RETRY_INTERVAL_SECONDS", "2.0")
+)
 
 # 样本表名称与关键列
 SAMPLE_SHEET_NAME = os.environ.get("SAMPLE_SHEET_NAME", "样本表")

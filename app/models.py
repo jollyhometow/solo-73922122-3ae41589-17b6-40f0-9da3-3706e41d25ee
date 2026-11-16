@@ -11,12 +11,15 @@ from pydantic import BaseModel, Field
 class TaskStatus(str, Enum):
     """任务生命周期状态。
 
-    QUEUED      已受理，等待重算名额
-    RUNNING     正在重算
-    COMPLETED   正常完成，结果已发布
-    FAILED      整批失败（公式错误/重算失败/超时），不发布逐样本结果
-    CANCELLED   已取消，不发布结果
-    INTERRUPTED 服务重启时发现该批未走完终态
+    QUEUED          已受理，等待重算名额
+    RUNNING         正在重算
+    COMPLETED       正常完成，结果已发布
+    FAILED          整批失败（公式错误/重算失败/超时），不发布逐样本结果
+    CANCELLED       已取消，不发布结果
+    INTERRUPTED     服务重启时发现该批未走完终态
+    CLEANUP_PENDING 计算进程已退出，但暂存（原件/目录）删除失败；
+                    保留原收尾原因，不发布判定、不释放名额，
+                    待存储恢复后自动续清，清完才落对应终态
     """
 
     QUEUED = "queued"
@@ -25,6 +28,7 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
+    CLEANUP_PENDING = "cleanup_pending"
 
 
 # 终态集合：进入后不可再取消
@@ -35,11 +39,12 @@ TERMINAL_STATUSES = {
     TaskStatus.INTERRUPTED,
 }
 
-# 不发布逐样本结果的终态
+# 不发布逐样本结果的状态（含待清理：判定一律不发布）
 NO_RESULT_STATUSES = {
     TaskStatus.FAILED,
     TaskStatus.CANCELLED,
     TaskStatus.INTERRUPTED,
+    TaskStatus.CLEANUP_PENDING,
 }
 
 
@@ -74,6 +79,11 @@ class TaskRecord(BaseModel):
     error_code: Optional[str] = None
     error_message: Optional[str] = None
     cancel_requested: bool = False
+    # 待清理（cleanup_pending）时：清理完成后要落入的终态
+    # （cancelled / failed / interrupted / completed），重启后不丢失
+    pending_final_status: Optional[str] = None
+    # 最近一次暂存删除失败的原因（如权限不足），便于查询与运维定位
+    cleanup_error: Optional[str] = None
     samples: Optional[list[SampleResult]] = None
     summary: Optional[dict] = None
 

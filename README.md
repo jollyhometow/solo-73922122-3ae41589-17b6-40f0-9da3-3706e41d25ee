@@ -30,13 +30,16 @@ FastAPI + openpyxl + LibreOffice（headless）完成自动核对，决定工作�
 | 并发 | 最多 **2 批同时重算**，超出的任务在队列中等待（状态 `queued`） |
 | 单批时限 | LibreOffice 重算 **10 秒**，超时判 `failed`（`RECALC_TIMEOUT`），不发布结果 |
 | 取消 | 立即受理；排队任务立即落 `cancelled`；运行中任务通知协程后，**等计算进程及子进程退出、暂存清理完毕**才落 `cancelled` 并释放名额 |
-| 终态保护 | 已完成/失败/取消/中断的任务再次取消 → 告知“不可取消”，状态不变 |
+| 清理失败 | 暂存（原件/目录）删除失败（如父目录权限被收回）→ 任务转 **`cleanup_pending`（待清理）**：可查询、保留取消/超时等原收尾原因、不发布判定、**不释放该批名额**；后台每 2 秒自动续清，**全部暂存实际清除**才落对应终态并**释放名额一次**；清理绝不 chmod 擅改管理员设置的目录权限 |
+| 终态保护 | 已完成/失败/取消/中断及待清理的任务再次取消 → 告知“不可取消”，状态不变 |
 | 隔离 | 每批独立暂存目录、独立 LibreOffice profile、独立进程组、精简环境变量；工作簿/进程/结果互不影响 |
-| 状态查询 | 只读，任何时候都可用，不受另一批取消/超时影响 |
-| 重启恢复 | 启动时把未走完终态的持久化任务标记为 `interrupted`，清理无主暂存 |
+| 状态查询 | 只读，任何时候都可用，不受另一批取消/超时/待清理影响 |
+| 重启恢复 | 启动时把未走完终态的持久化任务标记为 `interrupted`；**`cleanup_pending` 批次保持待清理并接续自动续清**（不重新重算、不遗忘原收尾原因、继续占用名额），无主暂存一并清理/重试 |
 
 任务状态机：`queued → running → completed | failed | cancelled`；
-重启后未完成 → `interrupted`。取消、超时、失败均**不发布**逐样本结果。
+计算进程退出后若暂存删除失败 → `cleanup_pending` →（续清成功）→ 原终态；
+重启后未完成 → `interrupted`。取消、超时、失败、待清理均**不发布**逐样本结果。
+两名额均被待清理批次占用时，新批次继续排队，清理成功后自行推进。
 
 ## 三、API（启动后访问 `/docs` 查看交互式文档）
 
@@ -66,7 +69,8 @@ docker compose up --build
 容器内以非 root 用户运行，LibreOffice 通过 apt 安装，任务数据持久化在
 Docker volume `verdict-data`（`/data`）。可用环境变量调整：
 `RECALC_TIMEOUT_SECONDS`、`MAX_CONCURRENT_BATCHES`、`MAX_UPLOAD_BYTES`、
-`MAX_SAMPLE_ROWS`、`DATA_DIR`、`SOFFICE_BIN`。
+`MAX_SAMPLE_ROWS`、`DATA_DIR`、`SOFFICE_BIN`、`CLEANUP_RETRY_INTERVAL_SECONDS`
+（暂存删除失败后的自动续清间隔，默认 2 秒）。
 
 ### 本地直接运行（需本机已有 soffice）
 
@@ -110,9 +114,13 @@ pytest -q
 SOFFICE_BIN=/path/to/soffice SOFFICE_LD_LIBRARY_PATH=/path/to/libs pytest -q
 ```
 
-测试覆盖（25 个用例）：缓存缺失/一致/失真、样例文件、宏与外链拒收、
+测试覆盖（36 个用例）：缓存缺失/一致/失真、样例文件、宏与外链拒收、
 超限与结构校验、公式错误整批失败、运行中取消、排队取消、终态不可取消、
-两批并发与名额释放、暂存清理、真实 LibreOffice 超时、重启中断标记。
+两批并发与名额释放、暂存清理、真实 LibreOffice 超时、重启中断标记；
+清理失败专项：取消/超时/排队取消/正常完成后删除失败转 `cleanup_pending`
+（保留原因、不发布判定、不释放名额）、存储恢复自动续清、待清理占满名额时
+新批次排队并自动推进、重启接续待清理批次、无主暂存重试、真实文件权限下
+不擅改目录权限、HTTP 层 `/docs` + 上传/查询/取消全流程。
 
 ## 七、目录结构
 
@@ -123,7 +131,7 @@ app/            FastAPI 应用
   security.py     宏/外链/结构拒收校验（原件只读）
   workbook_io.py  openpyxl 读缓存、读重算结果、错误识别
   recalc.py       LibreOffice 子进程、独立 profile/进程组、超时与取消
-  manager.py      名额控制、状态机、持久化与重启恢复
+  manager.py      名额控制、状态机、清理失败续清、持久化与重启恢复
   main.py         HTTP 入口
 scripts/        失真样例生成器
 samples/        已生成的缓存失真样例
